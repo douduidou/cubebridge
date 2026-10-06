@@ -94,10 +94,17 @@ static atomic_uint s_snapshot_session;
 static atomic_bool s_close_pending;
 static atomic_bool s_fault;
 static atomic_bool s_profile_dirty;   // 身份档案切换 -> 刷新广播名
+// 源魔方掉线时刻 (µs, 0=正常)。源端短暂掉线时保留手机会话, 超过宽限期才断开。
+static atomic_llong s_source_lost_us;
+#define BRIDGE_SOURCE_GRACE_US (60LL * 1000000LL)
 static uint8_t s_battery; // main task only; 0 until source reports a value
 enum { CMD_INITIAL = 100 };
 typedef struct { uint32_t session; int cmd; } command_t;
-typedef struct { uint32_t session; uint8_t frame[GAN_FRAME_LEN]; } tx_t;
+typedef struct {
+    uint32_t session;
+    uint8_t frame[GAN_FRAME_LEN];
+    bool droppable;   // 姿态帧: 拥塞时可直接丢弃, 不视为传输故障
+} tx_t;
 static QueueHandle_t s_commands, s_tx;
 static bool s_tx_pending;
 static tx_t s_pending;
@@ -111,10 +118,11 @@ static bool bridge_available(void) {
 void gan_gatt_set_bridge_ready(uint32_t generation) {
     if (!generation) {
         if (atomic_exchange(&s_source_generation, 0))
-            atomic_store(&s_close_pending, true);
+            atomic_store(&s_source_lost_us, (long long)esp_timer_get_time());
         atomic_store(&s_subscribed, false);
     } else if (!atomic_load(&s_fault) && cube_client_generation_valid(generation)) {
         atomic_store(&s_source_generation, generation);
+        atomic_store(&s_source_lost_us, (long long)0);
     }
 }
 
@@ -149,7 +157,7 @@ static bool post_command(int cmd) {
 static bool enqueue_frame(const uint8_t *frame, uint32_t session) {
     if (!bridge_available() || !atomic_load(&s_subscribed) ||
         session != atomic_load(&s_session)) return false;
-    tx_t item = { .session = session };
+    tx_t item = { .session = session, .droppable = false };
     memcpy(item.frame, frame, GAN_FRAME_LEN);
     if (xQueueSend(s_tx, &item, 0) != pdTRUE) {
         transport_fault("TX queue overflow");
@@ -169,7 +177,7 @@ bool gan_gatt_notify_drop(const uint8_t *frame, size_t len) {
     uint32_t session = atomic_load(&s_session);
     if (!frame || len != GAN_FRAME_LEN || atomic_load(&s_snapshot_session) != session ||
         !bridge_available() || !atomic_load(&s_subscribed)) return false;
-    tx_t item = { .session = session };
+    tx_t item = { .session = session, .droppable = true };
     memcpy(item.frame, frame, GAN_FRAME_LEN);
     return xQueueSend(s_tx, &item, 0) == pdTRUE;
 }
@@ -424,16 +432,27 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
 }
 
 static void tx_tick(struct ble_npl_event *event) {
-    if (!bridge_available() || atomic_load(&s_close_pending)) {
+    const bool available = bridge_available();
+    bool close = atomic_load(&s_close_pending);
+    // 源魔方短暂掉线: 保留手机会话, 只在超过宽限期后才真正断开
+    if (!available && !close && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        const long long lost = atomic_load(&s_source_lost_us);
+        if (lost && esp_timer_get_time() - lost >= BRIDGE_SOURCE_GRACE_US) {
+            ESP_LOGW(TAG, "源端掉线超过 %llds, 关闭手机会话",
+                     (long long)(BRIDGE_SOURCE_GRACE_US / 1000000));
+            close = true;
+        }
+    }
+    if (!available || close) {
         atomic_store(&s_subscribed, false);
         s_host_subscribed = false;
         s_tx_pending = false;
         if (ble_gap_adv_active()) ble_gap_adv_stop();
-        if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        if (close && s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             int rc = ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
             if (rc && rc != BLE_HS_EALREADY) ESP_LOGW(TAG, "terminate rc=%d", rc);
             // Keep closure latched until the disconnect callback.
-        } else {
+        } else if (close) {
             atomic_store(&s_close_pending, false);
         }
         tx_t discard;
@@ -463,11 +482,23 @@ static void tx_tick(struct ble_npl_event *event) {
         struct os_mbuf *om = ble_hs_mbuf_from_flat(encrypted, sizeof(encrypted));
         int rc = om ? ble_gatts_notify_custom(s_conn_handle, s_notify_handle, om) : BLE_HS_ENOMEM;
         if (rc == 0) { s_tx_pending = false; continue; }
-        // Retry the same frame in order. Never skip a failed state response or
-        // rely on a later move arriving to repair an unknown notification loss.
-        if ((rc != BLE_HS_ENOMEM && rc != BLE_HS_EBUSY && rc != BLE_HS_EAGAIN) ||
-            esp_timer_get_time() - s_pending_since >= 250000) {
-            transport_fault("notification could not be submitted within 250ms");
+        const long long waited_us = (long long)(esp_timer_get_time() - s_pending_since);
+        const bool retryable = (rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY || rc == BLE_HS_EAGAIN);
+        if (s_pending.droppable) {
+            // 姿态帧属于可丢弃数据: 拥塞时直接丢掉这一帧, 绝不断开会话
+            if (!retryable || waited_us >= 300000) {
+                static uint32_t s_gyro_drop_n;
+                if (++s_gyro_drop_n % 50 == 1)
+                    ESP_LOGW(TAG, "拥塞丢弃姿态帧 (rc=%d waited=%lldms)", rc, waited_us / 1000);
+                s_tx_pending = false;
+                continue;
+            }
+            break;
+        }
+        // 状态类帧 (动作/面贴/电量/硬件) 必须按序送达, 只留很长的兜底超时,
+        // 否则一次拥塞就会把手机与实体魔方两侧连接一起断掉。
+        if (!retryable || waited_us >= 8000000) {
+            transport_fault("notification could not be submitted within 8s");
         }
         break;
     }

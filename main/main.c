@@ -163,15 +163,21 @@ static void service_cube_events(void) {
             case CUBE_EVT_GYRO: {
                 // 源姿态 -> GAN Gen2 mode 1 帧。仅在档案声明支持陀螺仪且手机已订阅时转发。
                 static uint32_t s_gyro_n, s_gyro_drop;
+                static int64_t s_gyro_last_us;
                 s_gyro_n++;
                 float q[4];
                 gan_gyro_map(ev.gyro, q);
                 bool fwd = s_source_synced && gan_profile_active()->gyro_supported &&
                            gan_gatt_is_subscribed();
                 if (fwd) {
-                    uint8_t gyro_frame[GAN_FRAME_LEN];
-                    gan_proto_gyro(gyro_frame, q, NULL);
-                    if (!gan_gatt_notify_drop(gyro_frame, sizeof(gyro_frame))) s_gyro_drop++;
+                    // 限速到 ~10Hz: 源端 12.5Hz 直接透传容易把 BLE 发送通道压满
+                    const int64_t now_us = esp_timer_get_time();
+                    if (now_us - s_gyro_last_us >= 100000) {
+                        s_gyro_last_us = now_us;
+                        uint8_t gyro_frame[GAN_FRAME_LEN];
+                        gan_proto_gyro(gyro_frame, q, NULL);
+                        if (!gan_gatt_notify_drop(gyro_frame, sizeof(gyro_frame))) s_gyro_drop++;
+                    }
                 }
                 if (s_gyro_n % 100 == 1) {  // ~0.12Hz 采样, 只留运行痕迹
                     ESP_LOGI(TAG, "[gyro] n=%lu fwd=%d drop=%lu raw=%d %d %d %d q=%.3f %.3f %.3f %.3f",
